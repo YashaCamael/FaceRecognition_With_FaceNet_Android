@@ -24,6 +24,7 @@ import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.DocumentsContract
 import android.text.method.ScrollingMovementMethod
 import android.util.Size
@@ -67,6 +68,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fileReader : FileReader
     private lateinit var cameraProviderFuture : ListenableFuture<ProcessCameraProvider>
     private lateinit var sharedPreferences: SharedPreferences
+    private val SELECTED_DIRECTORY_URI_KEY = "selected_directory_uri"
+    private var currentCameraFacing = CameraSelector.LENS_FACING_BACK
+    private var isSwitchingCamera = false
 
     // <----------------------- User controls --------------------------->
 
@@ -138,31 +142,69 @@ class MainActivity : AppCompatActivity() {
             startCameraPreview()
         }
 
-        sharedPreferences = getSharedPreferences( getString( R.string.app_name ) , Context.MODE_PRIVATE )
-        isSerializedDataStored = sharedPreferences.getBoolean( SHARED_PREF_IS_DATA_STORED_KEY , false )
-        if ( !isSerializedDataStored ) {
-            Logger.log( "No serialized data was found. Select the images directory.")
-            showSelectDirectoryDialog()
-        }
-        else {
-            val alertDialog = AlertDialog.Builder( this ).apply {
-                setTitle( "Serialized Data")
-                setMessage( "Existing image data was found on this device. Would you like to load it?" )
-                setCancelable( false )
-                setNegativeButton( "LOAD") { dialog, which ->
-                    dialog.dismiss()
-                    frameAnalyser.faceList = loadSerializedImageData()
-                    Logger.log( "Serialized data loaded.")
-                }
-                setPositiveButton( "RESCAN") { dialog, which ->
-                    dialog.dismiss()
-                    launchChooseDirectoryIntent()
-                }
-                create()
-            }
-            alertDialog.show()
+        // Directly access the "images" directory
+        val imagesDirectory = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "images")
+        loadImagesFromDirectory(imagesDirectory)
+
+        // Set up the switch camera button
+        activityMainBinding.switchCameraButton.setOnClickListener {
+            switchCamera()}
+
+    }
+
+    private fun switchCamera() {
+        if (isSwitchingCamera) return // Prevent multiple concurrent switches
+
+        isSwitchingCamera = true
+        currentCameraFacing = if (currentCameraFacing == CameraSelector.LENS_FACING_BACK) {
+            CameraSelector.LENS_FACING_FRONT
+        } else {
+            CameraSelector.LENS_FACING_BACK
         }
 
+        cameraProviderFuture.addListener({
+            val cameraProvider = cameraProviderFuture.get()
+            cameraProvider.unbindAll()
+            startCameraPreview()
+            isSwitchingCamera = false // Reset the flag after the switch is complete
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun loadImagesFromDirectory(imagesDirectory: File) {
+        val images = ArrayList<Pair<String, Bitmap>>()
+        var errorFound = false
+
+        if (imagesDirectory.exists() && imagesDirectory.isDirectory) {
+            for (personDirectory in imagesDirectory.listFiles()!!) {
+                if (personDirectory.isDirectory) {
+                    val name = personDirectory.name
+                    for (imageFile in personDirectory.listFiles()!!) {
+                        try {
+                            val imageUri = Uri.fromFile(imageFile)
+                            images.add(Pair(name, getFixedBitmap(imageUri)))
+                        } catch (e: Exception) {
+                            errorFound = true
+                            Logger.log("Could not parse an image in $name directory.")
+                            break
+                        }
+                    }
+                    Logger.log("Found ${personDirectory.listFiles()?.size ?: 0} images in $name directory")
+                }
+            }
+
+            if (!errorFound) {
+                fileReader.run(images, fileReaderCallback)
+                Logger.log("Detecting faces in ${images.size} images ...")
+            } else {
+                // Handle errors if any images couldn't be parsed
+                Logger.log("Some errors occurred while parsing images.")
+                // You might want to show a message to the user here
+            }
+        } else {
+            // Handle the case where the "images" directory doesn't exist
+            Logger.log("The 'images' directory does not exist.")
+            // You might want to show a message to the user or create the directory
+        }
     }
 
     // ---------------------------------------------- //
@@ -179,7 +221,7 @@ class MainActivity : AppCompatActivity() {
     private fun bindPreview(cameraProvider : ProcessCameraProvider) {
         val preview : Preview = Preview.Builder().build()
         val cameraSelector : CameraSelector = CameraSelector.Builder()
-            .requireLensFacing( cameraFacing )
+            .requireLensFacing(currentCameraFacing) // Use the currentCameraFacing variable
             .build()
         preview.setSurfaceProvider( previewView.surfaceProvider )
         val imageFrameAnalysis = ImageAnalysis.Builder()
@@ -243,19 +285,32 @@ class MainActivity : AppCompatActivity() {
     }
 
 
-    private fun launchChooseDirectoryIntent() {
-        val intent = Intent( Intent.ACTION_OPEN_DOCUMENT_TREE )
-        // startForActivityResult is deprecated.
-        // See this SO thread -> https://stackoverflow.com/questions/62671106/onactivityresult-method-is-deprecated-what-is-the-alternative
-        directoryAccessLauncher.launch( intent )
-    }
+//    private fun launchChooseDirectoryIntent() {
+//        val intent = Intent( Intent.ACTION_OPEN_DOCUMENT_TREE )
+//        // startForActivityResult is deprecated.
+//        // See this SO thread -> https://stackoverflow.com/questions/62671106/onactivityresult-method-is-deprecated-what-is-the-alternative
+//        directoryAccessLauncher.launch( intent )
+//    }
 
+    private fun launchChooseDirectoryIntent() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            // Set the default directory if it was previously selected
+            val savedUriString = sharedPreferences.getString(SELECTED_DIRECTORY_URI_KEY, null)
+            if (savedUriString != null){
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, Uri.parse(savedUriString))
+            }
+        }
+        directoryAccessLauncher.launch(intent)
+    }
 
     // Read the contents of the select directory here.
     // The system handles the request code here as well.
     // See this SO question -> https://stackoverflow.com/questions/47941357/how-to-access-files-in-a-directory-given-a-content-uri
     private val directoryAccessLauncher = registerForActivityResult( ActivityResultContracts.StartActivityForResult() ) {
         val dirUri = it.data?.data ?: return@registerForActivityResult
+        // Save the selected directory URI in SharedPreferences
+        sharedPreferences.edit().putString(SELECTED_DIRECTORY_URI_KEY, dirUri.toString()).apply()
+
         val childrenUri =
             DocumentsContract.buildChildDocumentsUriUsingTree(
                 dirUri,
